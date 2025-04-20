@@ -168,7 +168,6 @@ def get_uninext_features(model, images, alpha):
             pooled_features[i] = valid_tokens.mean(dim=0)
         else:
             pooled_features[i] = local_features[i].mean(dim=0)
-
     del last_feat, alpha_down, alpha_mask, local_features, valid_tokens
     torch.cuda.empty_cache()
     return pooled_features
@@ -228,18 +227,26 @@ def main():
         image_projection.weight.copy_(uninext_model.clip_proj_weight.t())
         image_projection.bias.zero_()
 
-    optimizer = torch.optim.Adam(
-        list(uninext_model.parameters()) + list(image_projection.parameters()),
-        lr=1e-5
-    )
+    optimizer = torch.optim.Adam([
+        {'params': uninext_model.parameters(), 'lr': 1e-5},
+        {'params': image_projection.parameters(), 'lr': 1e-4}  # 投影层更高学习率
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 学习率调度器
     scaler = GradScaler()
 
     num_epochs = 20
-    lambda_align = 0.1
+    lambda_align = 0.05  # 降低对齐损失权重
     train_mse_loss_history = []
     val_mse_loss_history = []
     train_total_loss_history = []
     val_total_loss_history = []
+    val_seg_loss_history = []
+    
+    # 早停参数
+    best_val_loss = float('inf')
+    patience = 3
+    counter = 0
+    best_model_path = "best_model.pth"
 
     for epoch in range(num_epochs):
         # 训练
@@ -253,7 +260,7 @@ def main():
             target_mask = target_mask.to(device).float()
             
             optimizer.zero_grad()
-            with autocast():  # Mixed precision
+            with autocast():  # 混合精度
                 last_feat, seg_pred = uninext_model(images)
                 loss_seg = seg_loss(seg_pred, target_mask)
                 uninext_features = get_uninext_features(uninext_model, images, alpha)
@@ -263,6 +270,9 @@ def main():
                 loss_total = loss_seg + lambda_align * loss_align
             
             scaler.scale(loss_total).backward()
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(uninext_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(image_projection.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
@@ -270,7 +280,7 @@ def main():
             total_train_total_loss += loss_total.item()
             if batch_idx % 10 == 0:
                 print(f"Epoch {epoch}, Batch {batch_idx}, Train MSE Loss: {loss_align.item()}, Train Total Loss: {loss_total.item()}")
-            # Clear batch tensors
+            # 清除批次张量
             del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
             torch.cuda.empty_cache()
         
@@ -285,6 +295,7 @@ def main():
         image_projection.eval()
         total_val_mse_loss = 0
         total_val_total_loss = 0
+        total_val_seg_loss = 0
         with torch.no_grad():
             for images, alpha, target_mask in val_dataloader:
                 images = images.to(device).float()
@@ -302,50 +313,87 @@ def main():
                 
                 total_val_mse_loss += loss_align.item()
                 total_val_total_loss += loss_total.item()
-                # Clear batch tensors
+                total_val_seg_loss += loss_seg.item()
+                print(f"Epoch {epoch}, Val Seg Loss: {loss_seg.item()}, Val Align Loss: {loss_align.item()}, Val Total Loss: {loss_total.item()}")
+                # 清除批次张量
                 del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
                 torch.cuda.empty_cache()
         
         avg_val_mse_loss = total_val_mse_loss / len(val_dataloader)
         avg_val_total_loss = total_val_total_loss / len(val_dataloader)
+        avg_val_seg_loss = total_val_seg_loss / len(val_dataloader)
         val_mse_loss_history.append(avg_val_mse_loss)
         val_total_loss_history.append(avg_val_total_loss)
-        print(f"Epoch {epoch}, Average Val MSE Loss: {avg_val_mse_loss}, Average Val Total Loss: {avg_val_total_loss}")
+        val_seg_loss_history.append(avg_val_seg_loss)
+        print(f"Epoch {epoch}, Average Val MSE Loss: {avg_val_mse_loss}, Average Val Seg Loss: {avg_val_seg_loss}, Average Val Total Loss: {avg_val_total_loss}")
 
+        # 学习率调度
+        scheduler.step()
+
+        # 早停
+        if avg_val_total_loss < best_val_loss:
+            best_val_loss = avg_val_total_loss
+            counter = 0
+            torch.save({
+                'uninext_state_dict': uninext_model.state_dict(),
+                'projection_state_dict': image_projection.state_dict()
+            }, best_model_path)
+            print(f"Saved best model at epoch {epoch} with val loss: {best_val_loss}")
+        else:
+            counter += 1
+            print(f"No improvement in val loss, counter: {counter}/{patience}")
+            if counter >= patience:
+                print("Early stopping triggered")
+                break
+
+        # 保存当前轮次模型
         torch.save({
             'uninext_state_dict': uninext_model.state_dict(),
             'projection_state_dict': image_projection.state_dict()
         }, f"uninext_epoch_{epoch}.pth")
 
     # 绘制 Loss 曲线
-    plt.figure(figsize=(10, 10))
+    plt.figure(figsize=(15, 10))
     
-    plt.subplot(2, 2, 1)
-    plt.plot(range(num_epochs), train_mse_loss_history, marker='o', linestyle='-', color='b', label='Train MSE Loss')
+    # Train MSE Loss
+    plt.subplot(2, 3, 1)
+    plt.plot(range(len(train_mse_loss_history)), train_mse_loss_history, marker='o', linestyle='-', color='b', label='Train MSE Loss')
     plt.title('Train MSE Loss Over Epochs')
     plt.xlabel('Epoch')
     plt.ylabel('Average MSE Loss')
     plt.grid(True)
     plt.legend()
 
-    plt.subplot(2, 2, 2)
-    plt.plot(range(num_epochs), val_mse_loss_history, marker='s', linestyle='--', color='r', label='Val MSE Loss')
+    # Val MSE Loss
+    plt.subplot(2, 3, 2)
+    plt.plot(range(len(val_mse_loss_history)), val_mse_loss_history, marker='s', linestyle='--', color='r', label='Val MSE Loss')
     plt.title('Val MSE Loss Over Epochs')
     plt.xlabel('Epoch')
     plt.ylabel('Average MSE Loss')
     plt.grid(True)
     plt.legend()
 
-    plt.subplot(2, 2, 3)
-    plt.plot(range(num_epochs), train_total_loss_history, marker='o', linestyle='-', color='b', label='Train Total Loss')
+    # Val Seg Loss
+    plt.subplot(2, 3, 3)
+    plt.plot(range(len(val_seg_loss_history)), val_seg_loss_history, marker='^', linestyle='-.', color='g', label='Val Seg Loss')
+    plt.title('Val Segmentation Loss Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Seg Loss')
+    plt.grid(True)
+    plt.legend()
+
+    # Train Total Loss
+    plt.subplot(2, 3, 4)
+    plt.plot(range(len(train_total_loss_history)), train_total_loss_history, marker='o', linestyle='-', color='b', label='Train Total Loss')
     plt.title('Train Total Loss Over Epochs')
     plt.xlabel('Epoch')
     plt.ylabel('Average Total Loss')
     plt.grid(True)
     plt.legend()
 
-    plt.subplot(2, 2, 4)
-    plt.plot(range(num_epochs), val_total_loss_history, marker='s', linestyle='--', color='r', label='Val Total Loss')
+    # Val Total Loss
+    plt.subplot(2, 3, 5)
+    plt.plot(range(len(val_total_loss_history)), val_total_loss_history, marker='s', linestyle='--', color='r', label='Val Total Loss')
     plt.title('Val Total Loss Over Epochs')
     plt.xlabel('Epoch')
     plt.ylabel('Average Total Loss')
