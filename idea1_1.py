@@ -196,7 +196,7 @@ class RefCocoDataset(Dataset):
 
 # UNINEXT 模型
 class UNINEXT(nn.Module):
-    def __init__(self):
+    def __init__(self, pretrained_path=None):
         super(UNINEXT, self).__init__()
         self.visual = ViT(
             img_size=224,
@@ -262,9 +262,20 @@ class UNINEXT(nn.Module):
             elif k == 'pos_embed':
                 adapted_state_dict['pos_embed'] = v[:, 1:]
         missing, unexpected = self.visual.load_state_dict(adapted_state_dict, strict=False)
-        print("Missing keys:", missing)
-        print("Unexpected keys:", unexpected)
+        print("Missing keys from CLIP initialization:", missing)
+        print("Unexpected keys from CLIP initialization:", unexpected)
         self.clip_proj_weight = clip_model.visual.proj
+
+        if pretrained_path is not None:
+            checkpoint = torch.load(pretrained_path, map_location=device)
+            # 适配 checkpoint 键名（根据 checkpoint 的实际结构调整）
+            state_dict = checkpoint if not isinstance(checkpoint, dict) else checkpoint.get('state_dict', checkpoint)
+            # 移除可能的前缀（例如 'module.'）
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            # 加载权重
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            print("Missing keys from pretrained checkpoint:", missing)
+            print("Unexpected keys from pretrained checkpoint:", unexpected)
 
     def forward(self, images):
         features = self.visual(images)
@@ -332,7 +343,12 @@ def main():
         pin_memory=True
     )
 
-    uninext_model = UNINEXT().to(device).float()
+    pretrained_path = "model_final.pth"  
+    if not os.path.exists(pretrained_path):
+        print(f"Pretrained checkpoint {pretrained_path} not found, initializing with CLIP weights only.")
+        pretrained_path = None
+    uninext_model = UNINEXT(pretrained_path=pretrained_path).to(device).float()
+
     alpha_clip_model, _ = alpha_clip.load(
         "ViT-B/16",
         alpha_vision_ckpt_pth="/root/autodl-tmp/checkpoints/clip_b16_grit+mim_fultune_4xe.pth",
