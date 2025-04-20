@@ -1,7 +1,7 @@
 # uninext_improvement_idea
 ## idea1 
-idea1_1:只对齐vit部分，之后用对齐MSE指导训练
-idea_2:同时使用对齐MSE和分割MSE指导训练
+idea1:只对齐vit部分，之后用对齐MSE指导训练
+idea1_1:同时使用对齐MSE和分割MSE指导训练
 ### UNINEXT 视觉编码器
 1. 输入：images [batch_size, 3, 224, 224]（RGB 图像，归一化）。
 - 初始化：使用 CLIP ViT-B/16 预训练权重初始化 ViT 编码器，适配权重到 ViT 结构，保存 CLIP 投影权重（[768, 512]）。
