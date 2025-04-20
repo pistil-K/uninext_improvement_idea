@@ -23,6 +23,22 @@ from UNINEXT.projects.UNINEXT.uninext.backbone import ViT
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# 计算 Rec@0.5
+def calculate_rec_at_0_5(pred_mask, target_mask):
+    # 对预测结果进行二值化处理（sigmoid）
+    pred_bin = torch.sigmoid(pred_mask) > 0.5
+    target_bin = target_mask > 0.5
+    
+    # 拉平成一维数组计算 recall
+    pred_bin = pred_bin.view(-1).cpu().numpy()
+    target_bin = target_bin.view(-1).cpu().numpy()
+
+    # 计算 Recall (True Positives / (True Positives + False Negatives))
+    true_positives = np.sum(pred_bin * target_bin)
+    false_negatives = np.sum((1 - pred_bin) * target_bin)
+    recall = true_positives / (true_positives + false_negatives + 1e-5)  # 避免除零错误
+    return recall
+
 # 自定义 MaskHeadSmallConv
 class MaskHeadSmallConv(nn.Module):
     def __init__(self, dim, fpn_dims, context_dim, use_raft=False, up_rate=4):
@@ -332,6 +348,7 @@ def main():
         image_projection.weight.copy_(uninext_model.clip_proj_weight.t())
         image_projection.bias.zero_()
 
+    # 不冻结 ViT，使用原学习率
     optimizer = torch.optim.Adam([
         {'params': uninext_model.parameters(), 'lr': 1e-5},
         {'params': image_projection.parameters(), 'lr': 1e-4}
@@ -348,6 +365,7 @@ def main():
     train_total_loss_history = []
     val_total_loss_history = []
     val_seg_loss_history = []
+    val_rec_at_0_5_history = []  # 添加 Rec@0.5 跟踪
 
     best_val_loss = float('inf')
     patience = 5
@@ -393,11 +411,13 @@ def main():
         train_total_loss_history.append(avg_train_total_loss)
         print(f"Epoch {epoch}, Average Train MSE Loss: {avg_train_mse_loss}, Average Train Total Loss: {avg_train_total_loss}")
 
+        # 验证模式
         uninext_model.eval()
         image_projection.eval()
         total_val_mse_loss = 0
         total_val_total_loss = 0
         total_val_seg_loss = 0
+        total_val_rec_at_0_5 = 0  # 初始化 Rec@0.5 累计
         with torch.no_grad():
             for images, alpha, target_mask in val_dataloader:
                 images = images.to(device).float()
@@ -416,9 +436,19 @@ def main():
                 total_val_mse_loss += loss_align.item()
                 total_val_total_loss += loss_total.item()
                 total_val_seg_loss += loss_seg.item()
-                print(f"Epoch {epoch}, Val Seg Loss: {loss_seg.item()}, Val Align Loss: {loss_align.item()}, Val Total Loss: {loss_total.item()}")
+
+                # 计算 Rec@0.5
+                rec_at_0_5 = calculate_rec_at_0_5(seg_pred, target_mask)
+                total_val_rec_at_0_5 += rec_at_0_5
+                
+                print(f"Epoch {epoch}, Val Seg Loss: {loss_seg.item()}, Val Align Loss: {loss_align.item()}, Val Total Loss: {loss_total.item()}, Val Rec@0.5: {rec_at_0_5}")
+
                 del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
                 torch.cuda.empty_cache()
+
+        # 计算平均 Rec@0.5
+        avg_val_rec_at_0_5 = total_val_rec_at_0_5 / len(val_dataloader)
+        val_rec_at_0_5_history.append(avg_val_rec_at_0_5)
         
         avg_val_mse_loss = total_val_mse_loss / len(val_dataloader)
         avg_val_total_loss = total_val_total_loss / len(val_dataloader)
@@ -426,7 +456,8 @@ def main():
         val_mse_loss_history.append(avg_val_mse_loss)
         val_total_loss_history.append(avg_val_total_loss)
         val_seg_loss_history.append(avg_val_seg_loss)
-        print(f"Epoch {epoch}, Average Val MSE Loss: {avg_val_mse_loss}, Average Val Seg Loss: {avg_val_seg_loss}, Average Val Total Loss: {avg_val_total_loss}")
+
+        print(f"Epoch {epoch}, Average Val Rec@0.5: {avg_val_rec_at_0_5}, Average Val MSE Loss: {avg_val_mse_loss}, Average Val Seg Loss: {avg_val_seg_loss}, Average Val Total Loss: {avg_val_total_loss}")
 
         # 学习率调度器更新
         scheduler.step()
@@ -451,6 +482,7 @@ def main():
             'projection_state_dict': image_projection.state_dict()
         }, f"uninext_epoch_{epoch}.pth")
 
+    # 绘制所有损失和 Rec@0.5 曲线
     plt.figure(figsize=(15, 10))
     
     plt.subplot(2, 3, 1)
@@ -493,8 +525,16 @@ def main():
     plt.grid(True)
     plt.legend()
 
-    plt.tight_layout()
-    plt.savefig('loss_curves.png')
+    plt.subplot(2, 3, 6)
+    plt.plot(range(len(val_rec_at_0_5_history)), val_rec_at_0_5_history, marker='x', linestyle='-', color='m', label='Val Rec@0.5')
+    plt.title('Val Rec@0.5 Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Rec@0.5')
+    plt.grid(True)
+    plt.legend()
 
+    plt.tight_layout()
+    plt.savefig('loss_curves_and_rec_at_0_5.png')
+    
 if __name__ == "__main__":
     main()
