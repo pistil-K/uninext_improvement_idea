@@ -332,7 +332,6 @@ def main():
         image_projection.weight.copy_(uninext_model.clip_proj_weight.t())
         image_projection.bias.zero_()
 
-    # 不冻结 ViT，使用原学习率
     optimizer = torch.optim.Adam([
         {'params': uninext_model.parameters(), 'lr': 1e-5},
         {'params': image_projection.parameters(), 'lr': 1e-4}
@@ -343,7 +342,7 @@ def main():
     scaler = GradScaler()
 
     num_epochs = 50
-    lambda_align = 0.02
+    lambda_align = 0.1
     train_mse_loss_history = []
     val_mse_loss_history = []
     train_total_loss_history = []
