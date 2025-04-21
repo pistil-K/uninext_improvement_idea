@@ -25,18 +25,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 计算 Rec@0.5
 def calculate_rec_at_0_5(pred_mask, target_mask):
-    # 对预测结果进行二值化处理（sigmoid）
     pred_bin = torch.sigmoid(pred_mask) > 0.5
     target_bin = target_mask > 0.5
-    
-    # 拉平成一维数组计算 recall
     pred_bin = pred_bin.view(-1).cpu().numpy()
     target_bin = target_bin.view(-1).cpu().numpy()
-
-    # 计算 Recall (True Positives / (True Positives + False Negatives))
     true_positives = np.sum(pred_bin * target_bin)
     false_negatives = np.sum((1 - pred_bin) * target_bin)
-    recall = true_positives / (true_positives + false_negatives + 1e-5)  # 避免除零错误
+    recall = true_positives / (true_positives + false_negatives + 1e-5)
     return recall
 
 # 自定义 MaskHeadSmallConv
@@ -51,19 +46,13 @@ class MaskHeadSmallConv(nn.Module):
         self.up_rate = up_rate
         inter_dims = [dim, context_dim, context_dim, context_dim, context_dim, context_dim]
 
-        # 添加适配层，将输入通道从 dim 降到 context_dim
         self.adapter_input = nn.Conv2d(dim, context_dim, kernel_size=1)
-
-        # 修改 lay1 和 lay2 的输入通道数
-        self.lay1 = torch.nn.Conv2d(context_dim, dim//4, 3, padding=1)  # 输入通道从 dim 改为 context_dim
+        self.lay1 = torch.nn.Conv2d(context_dim, dim//4, 3, padding=1)
         self.lay2 = torch.nn.Conv2d(dim//4, dim//32, 3, padding=1)
-
         self.lay3 = torch.nn.Conv2d(inter_dims[1], inter_dims[2], 3, padding=1)
         self.lay4 = torch.nn.Conv2d(inter_dims[2], inter_dims[3], 3, padding=1)
         self.jia_dcn = torch.nn.Conv2d(inter_dims[3], inter_dims[4], 3, padding=1)
         self.dim = dim
-
-        # 添加输出适配层
         self.output_conv = nn.Conv2d(dim//32, 1, kernel_size=1)
         self.upsample = nn.Upsample(size=(224, 224), mode='bilinear', align_corners=False)
 
@@ -90,8 +79,7 @@ class MaskHeadSmallConv(nn.Module):
         if not isinstance(x, (list, tuple)):
             x = [x] * 3
 
-        # 适配输入通道数
-        x = [self.adapter_input(feature) for feature in x]  # 将通道从 768 降到 256
+        x = [self.adapter_input(feature) for feature in x]
 
         if fpns is not None:
             cur_fpn = self.adapter1(fpns[0])
@@ -137,7 +125,6 @@ class MaskHeadSmallConv(nn.Module):
         else:
             return fused_x
 
-# 定义 _expand 函数
 def _expand(tensor, factor):
     return tensor.repeat(factor, 1, 1, 1)
 
@@ -153,12 +140,24 @@ class RefCocoDataset(Dataset):
             raise ValueError("split must be 'train' or 'val'")
         with open(self.json_path, "r") as f:
             self.data = json.load(f)
-        self.transform = transforms.Compose([
+        self.image_transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(degrees=15),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.mask_transform = transforms.Compose([
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ToTensor(),
+        ])
+        self.binary_mask_transform = transforms.Compose([
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15, interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor(),
         ])
         self.valid_samples = []
         image_ids = set(img["id"] for img in self.data["images"])
@@ -175,7 +174,7 @@ class RefCocoDataset(Dataset):
         image_info = next(img for img in self.data["images"] if img["id"] == image_id)
         image_path = os.path.join(self.image_root, image_info["file_name"])
         image = Image.open(image_path).convert("RGB")
-        image = self.transform(image)
+
         try:
             if isinstance(ann["segmentation"], list):
                 rles = mask_utils.frPyObjects(ann["segmentation"], image_info["height"], image_info["width"])
@@ -184,19 +183,31 @@ class RefCocoDataset(Dataset):
                 mask = mask_utils.decode(ann["segmentation"])
             if mask.ndim == 3:
                 mask = np.max(mask, axis=2)
-            mask = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
-            mask = (mask > 0).astype(np.float32)
-            alpha = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
-            target_mask = torch.tensor(mask, dtype=torch.float32)
+            mask = mask.astype(np.float32)
+            mask_pil = Image.fromarray(mask * 255.0).convert("L")
+
+            seed = torch.randint(0, 1000000, (1,)).item()
+            torch.manual_seed(seed)
+            image = self.image_transform(image)
+            torch.manual_seed(seed)
+            alpha = self.mask_transform(mask_pil)
+            torch.manual_seed(seed)
+            binary_mask = self.binary_mask_transform(mask_pil)
+
+            alpha = alpha.clamp(0, 1)  # [1, 224, 224]
+            target_mask = binary_mask.squeeze(0)  # Remove channel dim: [1, 224, 224] -> [224, 224]
+            target_mask = (target_mask > 0.0).float()
         except Exception as e:
             print(f"Error processing mask for annotation {ann['id']}: {e}")
+            image = self.image_transform(image)
             alpha = torch.zeros(1, 224, 224, dtype=torch.float32)
             target_mask = torch.zeros(224, 224, dtype=torch.float32)
+
         return image, alpha, target_mask
 
 # UNINEXT 模型
 class UNINEXT(nn.Module):
-    def __init__(self, pretrained_path=None):
+    def __init__(self):
         super(UNINEXT, self).__init__()
         self.visual = ViT(
             img_size=224,
@@ -265,17 +276,7 @@ class UNINEXT(nn.Module):
         print("Missing keys from CLIP initialization:", missing)
         print("Unexpected keys from CLIP initialization:", unexpected)
         self.clip_proj_weight = clip_model.visual.proj
-
-        if pretrained_path is not None:
-            checkpoint = torch.load(pretrained_path, map_location=device)
-            # 适配 checkpoint 键名（根据 checkpoint 的实际结构调整）
-            state_dict = checkpoint if not isinstance(checkpoint, dict) else checkpoint.get('state_dict', checkpoint)
-            # 移除可能的前缀（例如 'module.'）
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            # 加载权重
-            missing, unexpected = self.load_state_dict(state_dict, strict=False)
-            print("Missing keys from pretrained checkpoint:", missing)
-            print("Unexpected keys from pretrained checkpoint:", unexpected)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def forward(self, images):
         features = self.visual(images)
@@ -287,12 +288,12 @@ class UNINEXT(nn.Module):
 def get_uninext_features(model, images, alpha):
     last_feat, _ = model(images)
     batch_size = last_feat.size(0)
-    alpha_down = F.avg_pool2d(alpha, kernel_size=16, stride=16)
+    alpha_down = F.avg_pool2d(alpha, kernel_size=16, stride=16)  # [bs, 1, 14, 14]
     alpha_mask = (alpha_down > 0.1).float()
-    alpha_mask = alpha_mask.squeeze(1)
-    local_features = last_feat.permute(0, 2, 3, 1)
-    local_features = local_features.reshape(batch_size, -1, 768)
-    alpha_mask = alpha_mask.reshape(batch_size, -1)
+    alpha_mask = alpha_mask.squeeze(1)  # [bs, 14, 14]
+    local_features = last_feat.permute(0, 2, 3, 1)  # [bs, 14, 14, 768]
+    local_features = local_features.reshape(batch_size, -1, 768)  # [bs, 196, 768]
+    alpha_mask = alpha_mask.reshape(batch_size, -1)  # [bs, 196]
     pooled_features = torch.zeros(batch_size, 768, device=device)
     for i in range(batch_size):
         valid_tokens = local_features[i][alpha_mask[i] > 0]
@@ -308,11 +309,22 @@ def get_uninext_features(model, images, alpha):
 def get_alpha_clip_mask_emb(model, images, alpha):
     with torch.no_grad():
         embedding = model.visual(images, alpha)
+        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
     return embedding
 
-# MSE 损失
-def mse_loss(x, y):
-    return F.mse_loss(x, y)
+# 对比学习损失
+def contrastive_loss(uninext_features, alpha_clip_features, logit_scale, label_smoothing=0.1):
+    uninext_features = uninext_features / uninext_features.norm(dim=-1, keepdim=True)
+    alpha_clip_features = alpha_clip_features / alpha_clip_features.norm(dim=-1, keepdim=True)
+    sim_i2p = torch.matmul(alpha_clip_features, uninext_features.T)
+    sim_p2i = sim_i2p.T
+    sim_i2p = logit_scale.exp() * sim_i2p
+    sim_p2i = logit_scale.exp() * sim_p2i
+    bs = uninext_features.size(0)
+    targets = torch.arange(bs, dtype=torch.long, device=uninext_features.device)
+    loss = (F.cross_entropy(sim_i2p, targets, label_smoothing=label_smoothing) +
+            F.cross_entropy(sim_p2i, targets, label_smoothing=label_smoothing)) / 2
+    return loss
 
 # 分割损失
 def seg_loss(pred, target):
@@ -343,11 +355,7 @@ def main():
         pin_memory=True
     )
 
-    pretrained_path = "model_final.pth"  
-    if not os.path.exists(pretrained_path):
-        print(f"Pretrained checkpoint {pretrained_path} not found, initializing with CLIP weights only.")
-        pretrained_path = None
-    uninext_model = UNINEXT(pretrained_path=pretrained_path).to(device).float()
+    uninext_model = UNINEXT().to(device).float()
 
     alpha_clip_model, _ = alpha_clip.load(
         "ViT-B/16",
@@ -364,24 +372,22 @@ def main():
         image_projection.weight.copy_(uninext_model.clip_proj_weight.t())
         image_projection.bias.zero_()
 
-    # 不冻结 ViT，使用原学习率
     optimizer = torch.optim.Adam([
         {'params': uninext_model.parameters(), 'lr': 1e-5},
         {'params': image_projection.parameters(), 'lr': 1e-4}
     ])
-    
-    # 添加 CosineAnnealingLR 调度器
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=0)
     scaler = GradScaler()
 
-    num_epochs = 50
+    num_epochs = 100
     lambda_align = 0.1
-    train_mse_loss_history = []
-    val_mse_loss_history = []
+    train_align_loss_history = []
+    val_align_loss_history = []
     train_total_loss_history = []
     val_total_loss_history = []
     val_seg_loss_history = []
-    val_rec_at_0_5_history = []  # 添加 Rec@0.5 跟踪
+    val_rec_at_0_5_history = []
 
     best_val_loss = float('inf')
     patience = 5
@@ -391,13 +397,13 @@ def main():
     for epoch in range(num_epochs):
         uninext_model.train()
         image_projection.train()
-        total_train_mse_loss = 0
+        total_train_align_loss = 0
         total_train_total_loss = 0
         for batch_idx, (images, alpha, target_mask) in enumerate(train_dataloader):
             images = images.to(device).float()
             alpha = alpha.to(device).float()
             target_mask = target_mask.to(device).float()
-            
+
             optimizer.zero_grad()
             with autocast():
                 last_feat, seg_pred = uninext_model(images)
@@ -405,77 +411,73 @@ def main():
                 uninext_features = get_uninext_features(uninext_model, images, alpha)
                 uninext_features = image_projection(uninext_features)
                 alpha_clip_mask_emb = get_alpha_clip_mask_emb(alpha_clip_model, images, alpha)
-                loss_align = mse_loss(uninext_features, alpha_clip_mask_emb)
+                loss_align = contrastive_loss(uninext_features, alpha_clip_mask_emb, uninext_model.logit_scale)
                 loss_total = loss_seg + lambda_align * loss_align
-            
+
             scaler.scale(loss_total).backward()
             torch.nn.utils.clip_grad_norm_(uninext_model.parameters(), max_norm=1.0)
             torch.nn.utils.clip_grad_norm_(image_projection.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            
-            total_train_mse_loss += loss_align.item()
+
+            total_train_align_loss += loss_align.item()
             total_train_total_loss += loss_total.item()
             if batch_idx % 10 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Train MSE Loss: {loss_align.item()}, Train Total Loss: {loss_total.item()}")
+                print(f"Epoch {epoch}, Batch {batch_idx}, Train Align Loss: {loss_align.item()}, Train Total Loss: {loss_total.item()}")
             del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
             torch.cuda.empty_cache()
-        
-        avg_train_mse_loss = total_train_mse_loss / len(train_dataloader)
-        avg_train_total_loss = total_train_total_loss / len(train_dataloader)
-        train_mse_loss_history.append(avg_train_mse_loss)
-        train_total_loss_history.append(avg_train_total_loss)
-        print(f"Epoch {epoch}, Average Train MSE Loss: {avg_train_mse_loss}, Average Train Total Loss: {avg_train_total_loss}")
 
-        # 验证模式
+        avg_train_align_loss = total_train_align_loss / len(train_dataloader)
+        avg_train_total_loss = total_train_total_loss / len(train_dataloader)
+        train_align_loss_history.append(avg_train_align_loss)
+        train_total_loss_history.append(avg_train_total_loss)
+        print(f"Epoch {epoch}, Average Train Align Loss: {avg_train_align_loss}, Average Train Total Loss: {avg_train_total_loss}")
+
         uninext_model.eval()
         image_projection.eval()
-        total_val_mse_loss = 0
+        total_val_align_loss = 0
         total_val_total_loss = 0
         total_val_seg_loss = 0
-        total_val_rec_at_0_5 = 0  # 初始化 Rec@0.5 累计
+        total_val_rec_at_0_5 = 0
         with torch.no_grad():
             for images, alpha, target_mask in val_dataloader:
                 images = images.to(device).float()
                 alpha = alpha.to(device).float()
                 target_mask = target_mask.to(device).float()
-                
+
                 with autocast():
                     last_feat, seg_pred = uninext_model(images)
+                    print("seg_pred min:", seg_pred.min().item(), "max:", seg_pred.max().item(), "mean:", seg_pred.mean().item())
+                    print("sigmoid(seg_pred) min:", torch.sigmoid(seg_pred).min().item(), "max:", torch.sigmoid(seg_pred).max().item())
                     loss_seg = seg_loss(seg_pred, target_mask)
                     uninext_features = get_uninext_features(uninext_model, images, alpha)
                     uninext_features = image_projection(uninext_features)
                     alpha_clip_mask_emb = get_alpha_clip_mask_emb(alpha_clip_model, images, alpha)
-                    loss_align = mse_loss(uninext_features, alpha_clip_mask_emb)
+                    loss_align = contrastive_loss(uninext_features, alpha_clip_mask_emb, uninext_model.logit_scale)
                     loss_total = loss_seg + lambda_align * loss_align
-                
-                total_val_mse_loss += loss_align.item()
+
+                total_val_align_loss += loss_align.item()
                 total_val_total_loss += loss_total.item()
                 total_val_seg_loss += loss_seg.item()
-
-                # 计算 Rec@0.5
                 rec_at_0_5 = calculate_rec_at_0_5(seg_pred, target_mask)
                 total_val_rec_at_0_5 += rec_at_0_5
-                
+
                 print(f"Epoch {epoch}, Val Seg Loss: {loss_seg.item()}, Val Align Loss: {loss_align.item()}, Val Total Loss: {loss_total.item()}, Val Rec@0.5: {rec_at_0_5}")
 
                 del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
                 torch.cuda.empty_cache()
 
-        # 计算平均 Rec@0.5
         avg_val_rec_at_0_5 = total_val_rec_at_0_5 / len(val_dataloader)
         val_rec_at_0_5_history.append(avg_val_rec_at_0_5)
-        
-        avg_val_mse_loss = total_val_mse_loss / len(val_dataloader)
+        avg_val_align_loss = total_val_align_loss / len(val_dataloader)
         avg_val_total_loss = total_val_total_loss / len(val_dataloader)
         avg_val_seg_loss = total_val_seg_loss / len(val_dataloader)
-        val_mse_loss_history.append(avg_val_mse_loss)
+        val_align_loss_history.append(avg_val_align_loss)
         val_total_loss_history.append(avg_val_total_loss)
         val_seg_loss_history.append(avg_val_seg_loss)
 
-        print(f"Epoch {epoch}, Average Val Rec@0.5: {avg_val_rec_at_0_5}, Average Val MSE Loss: {avg_val_mse_loss}, Average Val Seg Loss: {avg_val_seg_loss}, Average Val Total Loss: {avg_val_total_loss}")
+        print(f"Epoch {epoch}, Average Val Rec@0.5: {avg_val_rec_at_0_5}, Average Val Align Loss: {avg_val_align_loss}, Average Val Seg Loss: {avg_val_seg_loss}, Average Val Total Loss: {avg_val_total_loss}")
 
-        # 学习率调度器更新
         scheduler.step()
 
         if avg_val_total_loss < best_val_loss:
@@ -498,22 +500,21 @@ def main():
             'projection_state_dict': image_projection.state_dict()
         }, f"uninext_epoch_{epoch}.pth")
 
-    # 绘制所有损失和 Rec@0.5 曲线
     plt.figure(figsize=(15, 10))
     
     plt.subplot(2, 3, 1)
-    plt.plot(range(len(train_mse_loss_history)), train_mse_loss_history, marker='o', linestyle='-', color='b', label='Train MSE Loss')
-    plt.title('Train MSE Loss Over Epochs')
+    plt.plot(range(len(train_align_loss_history)), train_align_loss_history, marker='o', linestyle='-', color='b', label='Train Align Loss')
+    plt.title('Train Align Loss Over Epochs')
     plt.xlabel('Epoch')
-    plt.ylabel('Average MSE Loss')
+    plt.ylabel('Average Align Loss')
     plt.grid(True)
     plt.legend()
 
     plt.subplot(2, 3, 2)
-    plt.plot(range(len(val_mse_loss_history)), val_mse_loss_history, marker='s', linestyle='--', color='r', label='Val MSE Loss')
-    plt.title('Val MSE Loss Over Epochs')
+    plt.plot(range(len(val_align_loss_history)), val_align_loss_history, marker='s', linestyle='--', color='r', label='Val Align Loss')
+    plt.title('Val Align Loss Over Epochs')
     plt.xlabel('Epoch')
-    plt.ylabel('Average MSE Loss')
+    plt.ylabel('Average Align Loss')
     plt.grid(True)
     plt.legend()
 
@@ -551,6 +552,6 @@ def main():
 
     plt.tight_layout()
     plt.savefig('loss_curves_and_rec_at_0_5.png')
-    
+
 if __name__ == "__main__":
     main()
