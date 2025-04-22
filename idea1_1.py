@@ -195,7 +195,7 @@ class RefCocoDataset(Dataset):
             binary_mask = self.binary_mask_transform(mask_pil)
 
             alpha = alpha.clamp(0, 1)  # [1, 224, 224]
-            target_mask = binary_mask.squeeze(0)  # Remove channel dim: [1, 224, 224] -> [224, 224]
+            target_mask = binary_mask.squeeze(0)  # [224, 224]
             target_mask = (target_mask > 0.0).float()
         except Exception as e:
             print(f"Error processing mask for annotation {ann['id']}: {e}")
@@ -288,12 +288,12 @@ class UNINEXT(nn.Module):
 def get_uninext_features(model, images, alpha):
     last_feat, _ = model(images)
     batch_size = last_feat.size(0)
-    alpha_down = F.avg_pool2d(alpha, kernel_size=16, stride=16)  # [bs, 1, 14, 14]
+    alpha_down = F.avg_pool2d(alpha, kernel_size=16, stride=16)
     alpha_mask = (alpha_down > 0.1).float()
-    alpha_mask = alpha_mask.squeeze(1)  # [bs, 14, 14]
-    local_features = last_feat.permute(0, 2, 3, 1)  # [bs, 14, 14, 768]
-    local_features = local_features.reshape(batch_size, -1, 768)  # [bs, 196, 768]
-    alpha_mask = alpha_mask.reshape(batch_size, -1)  # [bs, 196]
+    alpha_mask = alpha_mask.squeeze(1)
+    local_features = last_feat.permute(0, 2, 3, 1)
+    local_features = local_features.reshape(batch_size, -1, 768)
+    alpha_mask = alpha_mask.reshape(batch_size, -1)
     pooled_features = torch.zeros(batch_size, 768, device=device)
     for i in range(batch_size):
         valid_tokens = local_features[i][alpha_mask[i] > 0]
@@ -424,7 +424,9 @@ def main():
             total_train_total_loss += loss_total.item()
             if batch_idx % 10 == 0:
                 print(f"Epoch {epoch}, Batch {batch_idx}, Train Align Loss: {loss_align.item()}, Train Total Loss: {loss_total.item()}")
-            del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
+
+            # 释放内存
+            del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb, loss_seg, loss_align, loss_total
             torch.cuda.empty_cache()
 
         avg_train_align_loss = total_train_align_loss / len(train_dataloader)
@@ -464,7 +466,8 @@ def main():
 
                 print(f"Epoch {epoch}, Val Seg Loss: {loss_seg.item()}, Val Align Loss: {loss_align.item()}, Val Total Loss: {loss_total.item()}, Val Rec@0.5: {rec_at_0_5}")
 
-                del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb
+                # 释放内存
+                del images, alpha, target_mask, last_feat, seg_pred, uninext_features, alpha_clip_mask_emb, loss_seg, loss_align, loss_total
                 torch.cuda.empty_cache()
 
         avg_val_rec_at_0_5 = total_val_rec_at_0_5 / len(val_dataloader)
@@ -494,11 +497,6 @@ def main():
             if counter >= patience:
                 print("Early stopping triggered")
                 break
-
-        torch.save({
-            'uninext_state_dict': uninext_model.state_dict(),
-            'projection_state_dict': image_projection.state_dict()
-        }, f"uninext_epoch_{epoch}.pth")
 
     plt.figure(figsize=(15, 10))
     
@@ -552,6 +550,7 @@ def main():
 
     plt.tight_layout()
     plt.savefig('loss_curves_and_rec_at_0_5.png')
+    plt.close()  # Close plot to free memory
 
 if __name__ == "__main__":
     main()
